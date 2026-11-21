@@ -1,0 +1,286 @@
+"""Provider test helpers with explicit admission ownership."""
+
+import json
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
+from inspect import isawaitable
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import Mock
+
+import httpx
+import httpx2
+from openai import AsyncOpenAI
+from openai._models import construct_type
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.completion_create_params import CompletionCreateParamsStreaming
+
+from free_claude_code.application.reasoning import client_reasoning_policy
+from free_claude_code.config.constants import PROVIDER_MAX_ATTEMPTS_DEFAULT
+from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.async_iterators import AsyncCloseable
+from free_claude_code.core.json_types import JsonObject, JsonValue
+from free_claude_code.core.reasoning import ReasoningPolicy
+from free_claude_code.providers.admission import ProviderAdmissionController
+from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.openai_chat import (
+    OpenAIChatProvider,
+    create_openai_chat_provider,
+)
+from tests.wire_payload import object_array, string_payload
+
+type MockResponse = httpx.Response | httpx2.Response
+type MockHandler[RequestT] = Callable[
+    [RequestT], MockResponse | Awaitable[MockResponse]
+]
+
+
+async def mock_response[ResponseT: (httpx.Response, httpx2.Response)](
+    result: MockResponse | Awaitable[MockResponse],
+    expected: type[ResponseT],
+) -> ResponseT:
+    response = await result if isawaitable(result) else result
+    assert isinstance(response, expected)
+    return response
+
+
+REASONING_DEFAULT = ReasoningPolicy.provider_default()
+REASONING_ON = ReasoningPolicy.on()
+REASONING_OFF = ReasoningPolicy.off()
+
+
+def sdk_chat_chunk(value: Any) -> ChatCompletionChunk:
+    """Use the SDK's permissive wire construction for explicitly populated fixtures."""
+    if isinstance(value, ChatCompletionChunk):
+        return value
+
+    def plain(item: Any) -> Any:
+        if isinstance(item, (Mock, SimpleNamespace)):
+            return {
+                key: plain(value)
+                for key, value in vars(item).items()
+                if not key.startswith("_") and key not in {"method_calls"}
+            }
+        if isinstance(item, dict):
+            return {key: plain(value) for key, value in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [plain(value) for value in item]
+        return item
+
+    payload: dict[str, Any] = {
+        "id": "chat_fixture",
+        "object": "chat.completion.chunk",
+        "model": "test",
+        "created": 0,
+        **plain(value),
+    }
+    for choice in payload.get("choices", []):
+        choice.setdefault("index", 0)
+    if isinstance(usage := payload.get("usage"), dict):
+        usage.update(usage.pop("model_extra", {}))
+        usage.setdefault(
+            "total_tokens",
+            (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0),
+        )
+    chunk = construct_type(value=payload, type_=ChatCompletionChunk)
+    assert isinstance(chunk, ChatCompletionChunk)
+    return chunk
+
+
+class SDKStreamDouble[EventT](AsyncIterator[EventT]):
+    """Model the SDK iterator and async close API at mocked create boundaries."""
+
+    def __init__(
+        self,
+        source: AsyncIterable[EventT],
+        *,
+        close: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self._iterator = aiter(source)
+        self._close = close
+
+    def __aiter__(self) -> AsyncIterator[EventT]:
+        return self
+
+    async def __anext__(self) -> EventT:
+        return await anext(self._iterator)
+
+    async def close(self) -> None:
+        try:
+            if isinstance(self._iterator, AsyncCloseable):
+                await self._iterator.aclose()
+        finally:
+            if self._close is not None:
+                await self._close()
+
+
+def completed_chat_stream(text: str = "ok") -> SDKStreamDouble[ChatCompletionChunk]:
+    """Return an SDK stream that completes one text reply."""
+
+    async def chunks() -> AsyncIterator[ChatCompletionChunk]:
+        yield sdk_chat_chunk(
+            {"choices": [{"delta": {"role": "assistant", "content": text}}]}
+        )
+        yield sdk_chat_chunk({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+
+    return SDKStreamDouble(chunks())
+
+
+def make_provider_config(
+    api_key: str | None,
+    base_url: str,
+    http_read_timeout: float = 120.0,
+    http_write_timeout: float = 10.0,
+    http_connect_timeout: float = 10.0,
+    proxy: str | None = None,
+    log_raw_sse_events: bool = False,
+    log_api_error_tracebacks: bool = False,
+) -> ProviderConfig:
+    """Build a complete resolved config for isolated provider tests."""
+
+    return ProviderConfig(
+        api_key=api_key,
+        base_url=base_url,
+        http_read_timeout=http_read_timeout,
+        http_write_timeout=http_write_timeout,
+        http_connect_timeout=http_connect_timeout,
+        proxy=proxy,
+        log_raw_sse_events=log_raw_sse_events,
+        log_api_error_tracebacks=log_api_error_tracebacks,
+    )
+
+
+class PreparedChatRequest(CompletionCreateParamsStreaming, closed=True):
+    """Configured provider options sent through the OpenAI SDK."""
+
+
+async def capture_openai_chat_wire_body(body: JsonObject) -> JsonObject:
+    """Return the JSON body serialized by the OpenAI chat client."""
+    if "stream" in body:
+        raise TypeError("Prepared chat body already contains stream")
+
+    captured: list[JsonObject] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        payload = json.loads(request.content)
+        assert isinstance(payload, dict)
+        captured.append(payload)
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: [DONE]\n\n",
+        )
+
+    client = AsyncOpenAI(
+        api_key="test",
+        base_url="https://provider.invalid/v1",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        max_retries=0,
+    )
+    try:
+        # The provider prepared these SDK options, including provider extensions.
+        params = cast(PreparedChatRequest, {**body, "stream": True})
+        stream = await client.chat.completions.create(**params)
+        await stream.close()
+    finally:
+        await client.close()
+
+    assert len(captured) == 1
+    return captured[0]
+
+
+def immediate_admission(
+    *,
+    provider_name: str = "TEST",
+    max_attempts: int = PROVIDER_MAX_ATTEMPTS_DEFAULT,
+) -> ProviderAdmissionController:
+    """Return a real controller with deterministic zero-delay recovery."""
+    return ProviderAdmissionController(
+        provider_name=provider_name,
+        rate_limit=1_000_000,
+        rate_window=1.0,
+        max_concurrency=1_000,
+        max_attempts=max_attempts,
+        base_delay=0.0,
+        max_delay=0.0,
+        jitter=0.0,
+    )
+
+
+def profiled_provider(
+    provider_id: str,
+    config: ProviderConfig,
+    *,
+    admission: ProviderAdmissionController | None = None,
+) -> OpenAIChatProvider:
+    """Construct one declarative provider for a focused behavior test."""
+    return create_openai_chat_provider(
+        provider_id,
+        config,
+        admission or immediate_admission(provider_name=provider_id),
+    )
+
+
+def reasoning_for(request: MessagesRequest) -> ReasoningPolicy:
+    """Resolve provider-test input through the production client boundary."""
+
+    return client_reasoning_policy(request)
+
+
+def without_empty_reasoning(value: Any) -> Any:
+    """Compare unrelated wire contracts without negotiated empty placeholders.
+
+    Populated reasoning and all other request fields remain observable. Projection
+    tests assert the empty representations themselves.
+    """
+    empty_items: tuple[JsonObject, ...] = (
+        {"type": "thinking", "thinking": ""},
+        {
+            "type": "reasoning",
+            "content": [{"type": "reasoning_text", "text": ""}],
+            "summary": [],
+        },
+    )
+    if isinstance(value, list):
+        return [
+            without_empty_reasoning(item) for item in value if item not in empty_items
+        ]
+    if isinstance(value, dict):
+        return {
+            key: without_empty_reasoning(item)
+            for key, item in value.items()
+            if not (
+                value.get("role") == "assistant"
+                and key in {"reasoning_content", "reasoning"}
+                and item == ""
+            )
+        }
+    return value
+
+
+def continuation_seed(text: str = "", thinking: str = ""):
+    from free_claude_code.core.stream_recovery import ContinuationSeed
+
+    items: list[JsonObject] = []
+    if thinking:
+        items.append({"type": "thinking", "thinking": thinking})
+    if text:
+        items.append({"type": "text", "text": text})
+    return ContinuationSeed("messages", tuple(items))
+
+
+def assistant_history_text(rows: JsonValue):
+    """Read actual assistant answer text across both upstream request formats."""
+    parts = []
+    for row in object_array(rows):
+        if row.get("role") != "assistant":
+            continue
+        content = row.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        else:
+            parts.extend(
+                string_payload(part.get("text", ""))
+                for part in object_array(content)
+                if part.get("type") in {"text", "output_text"}
+            )
+    return "".join(parts)

@@ -1,0 +1,688 @@
+"""Shared OpenAI Responses execution over the official SDK."""
+
+import asyncio
+import uuid
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from functools import partial
+from typing import cast, override
+
+import httpx2
+from openai import AsyncOpenAI, AsyncStream
+from openai.types.responses import ResponseInputParam, ResponseStreamEvent
+from openai.types.responses.response_create_params import ResponseCreateParamsStreaming
+
+from free_claude_code.application.errors import InvalidRequestError
+from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.chat_completions.request import (
+    ChatRequest,
+    chat_responses_body,
+)
+from free_claude_code.core.chat_completions.responses_stream import ChatResponsesStream
+from free_claude_code.core.diagnostics import extract_upstream_error_detail
+from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.gemini import GeminiConversionError, GeminiRequest
+from free_claude_code.core.gemini.request import build_gemini_responses_request
+from free_claude_code.core.gemini.responses_stream import GeminiResponsesStream
+from free_claude_code.core.json_types import JsonObject
+from free_claude_code.core.openai_responses import (
+    OpenAIResponsesRequest,
+    ResponsesConversionError,
+    ResponsesProviderStream,
+    ResponsesStreamFailure,
+    ResponsesToolAdapter,
+    ResponsesToolCallBuffer,
+    ResponsesToolPolicy,
+    build_native_responses_request,
+    build_responses_provider_request,
+    responses_stream_failure_from_event,
+)
+from free_claude_code.core.openai_tool_names import OpenAIToolNameCodec
+from free_claude_code.core.reasoning import ReasoningControl, ReasoningPolicy
+from free_claude_code.core.stream_output import StreamOutput, completed_output
+from free_claude_code.core.stream_recovery import ContinuationSeed
+from free_claude_code.providers.admission import (
+    ProviderAdmissionController,
+    ProviderExecution,
+    ProviderOperationKind,
+)
+from free_claude_code.providers.attempt_loop import (
+    AttemptContext,
+    AttemptPlan,
+    FailureReporting,
+    TransportAttempt,
+    run_attempts,
+)
+from free_claude_code.providers.canonical_failures import (
+    context_window_exceeded_provider_failure,
+    is_context_window_error_code,
+    reports_context_window_incomplete,
+)
+from free_claude_code.providers.continuation import (
+    ContinuationRequest,
+)
+from free_claude_code.providers.endpoint import RequestEndpoint
+from free_claude_code.providers.endpoint_types import EndpointContext
+from free_claude_code.providers.failure_classification import classify
+from free_claude_code.providers.history_negotiation import (
+    HistoryModeCache,
+    resolve_history_overrides,
+)
+from free_claude_code.providers.history_replay import (
+    normalize_messages_history,
+    replay_origin,
+    validate_history,
+)
+from free_claude_code.providers.http import (
+    ProviderAttemptScope,
+    maybe_await_aclose,
+)
+from free_claude_code.providers.openai_client import OpenAIRequestClient
+from free_claude_code.providers.openai_stream import OpenAIStreamAdapter
+from free_claude_code.providers.reasoning_compatibility import (
+    ReasoningCorrection,
+    prepare_messages_reasoning,
+)
+from free_claude_code.providers.recovery_errors import RetryableProviderProtocolError
+from free_claude_code.providers.request_correction import (
+    CorrectionStep,
+    RequestCorrector,
+)
+
+from .presentation import (
+    MessagesResponsesPresenter,
+    NativeResponsesPresenter,
+    ResponsesPresenterFactory,
+    ResponsesStreamPresenter,
+)
+
+type ResponsesEventAdapter = Callable[[str, JsonObject], JsonObject]
+
+
+class _TruncatedResponsesStream(RetryableProviderProtocolError):
+    """A Responses stream ended without a terminal lifecycle event."""
+
+
+class OpenAIResponsesTransport:
+    """Execute public Responses requests with provider-owned retry semantics."""
+
+    def __init__(
+        self,
+        *,
+        client: AsyncOpenAI,
+        admission: ProviderAdmissionController,
+        history_cache: HistoryModeCache | None = None,
+        provider_name: str,
+        read_timeout_s: float,
+        log_raw_sse_events: bool,
+        endpoint_transport: httpx2.AsyncBaseTransport | None = None,
+        event_adapter_factory: Callable[[], ResponsesEventAdapter] | None = None,
+        correction_steps: Sequence[CorrectionStep] = (),
+        omitted_request_fields: frozenset[str] = frozenset(),
+        tool_policy: ResponsesToolPolicy = ResponsesToolPolicy(),
+    ) -> None:
+        self._client = client
+        self._endpoint_transport = endpoint_transport
+        self._event_adapter_factory = event_adapter_factory
+        self._correction_steps = tuple(correction_steps)
+        self._omitted_request_fields = omitted_request_fields
+        self._tool_policy = tool_policy
+        self._admission = admission
+        self._history_cache = (
+            history_cache if history_cache is not None else HistoryModeCache()
+        )
+        self._provider_name = provider_name
+        self._read_timeout_s = read_timeout_s
+        self._log_raw_sse_events = log_raw_sse_events
+
+    def stream_messages(
+        self,
+        request: MessagesRequest,
+        *,
+        input_tokens: int,
+        request_id: str | None,
+        response_model: str,
+        reasoning: ReasoningPolicy,
+        endpoint_context: EndpointContext | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        model_info: ProviderModelInfo | None = None,
+        can_disable_reasoning: bool = True,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        prepared, wire_reasoning = prepare_messages_reasoning(
+            request,
+            reasoning,
+            model_info=model_info,
+            can_disable=can_disable_reasoning,
+            normal_max_tokens=None,
+        )
+        body = self._build_messages_body(prepared, reasoning=wire_reasoning)
+        correction = (
+            ReasoningCorrection((("reasoning",),), "max_output_tokens", None)
+            if reasoning.control is ReasoningControl.PREFER_OFF
+            and wire_reasoning.control is ReasoningControl.OFF
+            else None
+        )
+        tool_names = OpenAIToolNameCodec.from_request(request)
+        message_id = f"msg_{uuid.uuid4()}"
+        return self._run_stream(
+            body,
+            reasoning_correction=correction,
+            endpoint_context=endpoint_context,
+            extra_headers=dict(extra_headers or {}),
+            request_id=request_id,
+            response_model=response_model,
+            presenter_factory=lambda pad_empty, origin: MessagesResponsesPresenter(
+                ResponsesProviderStream(
+                    message_id=message_id,
+                    model=response_model,
+                    input_tokens=input_tokens,
+                    origin=origin,
+                    tool_names=tool_names,
+                    log_raw_events=self._log_raw_sse_events,
+                    pad_empty=pad_empty,
+                )
+            ),
+            continuation=continuation,
+        )
+
+    def stream_gemini(
+        self,
+        request: GeminiRequest,
+        *,
+        input_tokens: int,
+        request_id: str | None,
+        response_model: str,
+        reasoning: ReasoningPolicy,
+        endpoint_context: EndpointContext | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        try:
+            prepared = build_gemini_responses_request(request, reasoning)
+        except GeminiConversionError as error:
+            raise InvalidRequestError(str(error)) from error
+        for field in self._omitted_request_fields - {"store", "include"}:
+            if field in prepared.body:
+                raise InvalidRequestError(
+                    f"{self._provider_name} cannot represent Gemini control {field}"
+                )
+        response_id = f"fcc_{uuid.uuid4().hex}"
+        return self._run_stream(
+            self._prepare_body(prepared.body),
+            request_id=request_id,
+            response_model=response_model,
+            endpoint_context=endpoint_context,
+            extra_headers=extra_headers,
+            continuation=continuation,
+            presenter_factory=lambda _pad_empty, origin: GeminiResponsesStream(
+                response_id=response_id,
+                model=response_model,
+                include_thoughts=request.include_thoughts,
+                origin=origin,
+                tool_names=prepared.tool_names,
+                declared_names=prepared.declared_names,
+                reserved_tool_ids=prepared.reserved_tool_ids,
+            ),
+        )
+
+    def stream_responses(
+        self,
+        request: OpenAIResponsesRequest,
+        *,
+        input_tokens: int,
+        request_id: str | None,
+        response_model: str,
+        reasoning: ReasoningPolicy,
+        endpoint_context: EndpointContext | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        del input_tokens
+        body, tools = self._build_native_body(request, reasoning=reasoning)
+        return self._run_stream(
+            body,
+            endpoint_context=endpoint_context,
+            extra_headers=dict(extra_headers or {}),
+            request_id=request_id,
+            response_model=response_model,
+            presenter_factory=lambda _pad_empty, _origin: NativeResponsesPresenter(
+                public_model=response_model, tool_events=tools.event_adapter()
+            ),
+            continuation=continuation,
+        )
+
+    def stream_chat(
+        self,
+        request: ChatRequest,
+        *,
+        input_tokens: int,
+        request_id: str | None,
+        response_model: str,
+        reasoning: ReasoningPolicy,
+        endpoint_context: EndpointContext | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        try:
+            body = chat_responses_body(request)
+            for field in self._omitted_request_fields - {"store", "include"}:
+                if field in body:
+                    raise InvalidRequestError(
+                        f"{self._provider_name} cannot represent Chat control {field}"
+                    )
+            translated = OpenAIResponsesRequest.model_validate(body)
+            body, _ = self._build_native_body(translated, reasoning=reasoning)
+            reserved = request.reserved_tool_ids()
+        except ValueError as error:
+            raise InvalidRequestError(str(error)) from error
+        return self._run_stream(
+            body,
+            request_id=request_id,
+            response_model=response_model,
+            endpoint_context=endpoint_context,
+            extra_headers=extra_headers,
+            continuation=continuation,
+            presenter_factory=lambda _pad_empty, origin: ChatResponsesStream(
+                model=response_model,
+                origin=origin,
+                reserved_tool_ids=reserved,
+                include_usage=request.include_usage,
+                include_thoughts=reasoning.output_enabled,
+            ),
+        )
+
+    def _build_messages_body(
+        self,
+        request: MessagesRequest,
+        *,
+        reasoning: ReasoningPolicy,
+        model_info: ProviderModelInfo | None = None,
+        can_disable_reasoning: bool = True,
+    ) -> JsonObject:
+        request = normalize_messages_history(request)
+        request, reasoning = prepare_messages_reasoning(
+            request,
+            reasoning,
+            model_info=model_info,
+            can_disable=can_disable_reasoning,
+            normal_max_tokens=None,
+        )
+        try:
+            return self._prepare_body(
+                cast(
+                    JsonObject,
+                    cast(
+                        ResponseCreateParamsStreaming,
+                        build_responses_provider_request(request, reasoning=reasoning),
+                    ),
+                )
+            )
+        except ResponsesConversionError as exc:
+            raise InvalidRequestError(str(exc)) from exc
+
+    def _build_native_body(
+        self,
+        request: OpenAIResponsesRequest,
+        *,
+        reasoning: ReasoningPolicy,
+    ) -> tuple[JsonObject, ResponsesToolAdapter]:
+        validate_history(request.model_dump(mode="json"))
+        if not request.model.strip():
+            raise InvalidRequestError("Responses request model must not be empty.")
+        if request.input is None or request.input == "" or request.input == []:
+            raise InvalidRequestError("Responses request input must not be empty.")
+        try:
+            tools = ResponsesToolAdapter(request, self._tool_policy)
+        except ResponsesConversionError as error:
+            raise InvalidRequestError(str(error)) from error
+        body = self._prepare_body(
+            build_native_responses_request(
+                tools.request,
+                model=request.model,
+                reasoning=reasoning,
+            )
+        )
+        return body, tools
+
+    def _prepare_body(self, body: JsonObject) -> JsonObject:
+        for field in self._omitted_request_fields:
+            body.pop(field, None)
+        return body
+
+    async def _run_stream(
+        self,
+        body: JsonObject,
+        *,
+        request_id: str | None,
+        response_model: str,
+        presenter_factory: ResponsesPresenterFactory,
+        endpoint_context: EndpointContext | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        reasoning_correction: ReasoningCorrection | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        execution = self._admission.start_execution(
+            request_id=request_id, model=str(body["model"])
+        )
+        endpoint = (
+            RequestEndpoint(endpoint_context) if endpoint_context is not None else None
+        )
+        request_client = OpenAIRequestClient(self._endpoint_transport)
+        provider_stream = self._run_execution(
+            body,
+            reasoning_correction=reasoning_correction,
+            request_id=request_id,
+            response_model=response_model,
+            presenter_factory=presenter_factory,
+            execution=execution,
+            endpoint=endpoint,
+            request_client=request_client,
+            extra_headers=extra_headers,
+            continuation=continuation,
+        )
+        try:
+            async for event in provider_stream:
+                yield event
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            execution.fail(error)
+            raise
+        else:
+            execution.succeed()
+        finally:
+            try:
+                await maybe_await_aclose(provider_stream)
+            finally:
+                try:
+                    await request_client.aclose()
+                finally:
+                    execution.abandon()
+
+    def _run_execution(
+        self,
+        body: JsonObject,
+        *,
+        request_id: str | None,
+        response_model: str,
+        presenter_factory: ResponsesPresenterFactory,
+        execution: ProviderExecution,
+        endpoint: RequestEndpoint | None = None,
+        request_client: OpenAIRequestClient,
+        extra_headers: Mapping[str, str] | None = None,
+        reasoning_correction: ReasoningCorrection | None = None,
+        continuation: ContinuationSeed | None = None,
+    ) -> AsyncIterator[StreamOutput]:
+        body = resolve_history_overrides(body)
+        continuation_request = ContinuationRequest("responses")
+        operation_kind = ProviderOperationKind.GENERATION
+        if continuation is not None:
+            body = continuation_request.build(body, continuation)
+            operation_kind = ProviderOperationKind.CONTINUATION
+        return run_attempts(
+            AttemptPlan(
+                body=body,
+                operation_kind=operation_kind,
+                execution=execution,
+                continuation=continuation_request,
+                corrector=partial(self._corrector, reasoning_correction),
+                start=partial(
+                    _ResponsesAttempt,
+                    transport=self,
+                    endpoint=endpoint,
+                    request_client=request_client,
+                    extra_headers=extra_headers,
+                    presenter_factory=presenter_factory,
+                ),
+                reporting=FailureReporting(read_timeout_s=self._read_timeout_s),
+                provider_name=self._provider_name,
+                transport="responses",
+                gateway_model=response_model,
+                refreshable=endpoint,
+            )
+        )
+
+    def _corrector(self, reasoning: ReasoningCorrection | None) -> RequestCorrector:
+        return RequestCorrector(
+            "responses", reasoning=reasoning, steps=self._correction_steps
+        )
+
+    async def _create_sdk_stream(
+        self,
+        body: JsonObject,
+        *,
+        client: AsyncOpenAI,
+        request_client: OpenAIRequestClient,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> AsyncStream[ResponseStreamEvent]:
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            raise InvalidRequestError("Responses request model must not be empty.")
+        input_value = cast(str | ResponseInputParam, body.get("input"))
+        extra_body = {
+            key: value
+            for key, value in body.items()
+            if key not in {"model", "input", "stream", "store"}
+        }
+        return await client.responses.create(
+            model=model,
+            input=input_value,
+            stream=True,
+            store=False,
+            extra_body=extra_body or None,
+            extra_headers={
+                **(extra_headers or {}),
+                **request_client.openai_headers(),
+            }
+            or None,
+        )
+
+
+def _effective_error(error: Exception) -> Exception:
+    if not isinstance(error, ResponsesStreamFailure):
+        return error
+    message = (
+        extract_upstream_error_detail(error).exception_text
+        or "Provider response failed."
+    )
+    if is_context_window_error_code(error.code):
+        return context_window_exceeded_provider_failure()
+    auth_status = classify(error).auth_status
+    if auth_status is not None:
+        return ExecutionFailure(
+            FailureKind.AUTHENTICATION
+            if auth_status == 401
+            else FailureKind.PERMISSION,
+            auth_status,
+            message,
+            False,
+        )
+    code = (error.code or "").lower()
+    if "rate" in code or "429" in code:
+        return ExecutionFailure(FailureKind.RATE_LIMIT, 429, message, True)
+    if any(marker in code for marker in ("overload", "capacity", "529")):
+        return ExecutionFailure(FailureKind.OVERLOADED, 529, message, True)
+    retryable = any(
+        marker in code for marker in ("server", "internal", "unavailable", "timeout")
+    )
+    return ExecutionFailure(FailureKind.UPSTREAM, 502, message, retryable)
+
+
+class _ResponsesAttempt(TransportAttempt):
+    """One Responses attempt over the OpenAI SDK."""
+
+    def __init__(
+        self,
+        context: AttemptContext,
+        *,
+        transport: OpenAIResponsesTransport,
+        endpoint: RequestEndpoint | None,
+        request_client: OpenAIRequestClient,
+        extra_headers: Mapping[str, str] | None,
+        presenter_factory: ResponsesPresenterFactory,
+    ) -> None:
+        super().__init__(context)
+        self._transport = transport
+        self._endpoint = endpoint
+        self._request_client = request_client
+        self._extra_headers = extra_headers
+        self._presenter_factory = presenter_factory
+        self._client: AsyncOpenAI | None = None
+        self._presenter: ResponsesStreamPresenter | None = None
+        self._start_events: tuple[str, ...] = ()
+        self._tool_buffer = ResponsesToolCallBuffer()
+        self._adapt_event = (
+            transport._event_adapter_factory()
+            if transport._event_adapter_factory is not None
+            else None
+        )
+        self._stopped = False
+
+    @property
+    @override
+    def normal_stop_seen(self) -> bool:
+        return self._stopped
+
+    @override
+    async def prepare(self) -> None:
+        transport = self._transport
+        endpoint = self._endpoint
+        self._client = (
+            self._request_client.for_endpoint(
+                transport._client, await endpoint.resolve()
+            )
+            if endpoint is not None
+            else transport._client
+        )
+        self.body = resolve_history_overrides(self.body)
+        origin = replay_origin(
+            transport._provider_name,
+            "responses",
+            str(self.body["model"]),
+            client=self._client,
+            endpoint=endpoint.snapshot if endpoint is not None else None,
+        )
+        self.sent_body = self.context.history.prepare(
+            self.body,
+            origin,
+            transport._history_cache,
+            continuation=self.context.continuing,
+        )
+        self._presenter = self._presenter_factory(not self.context.continuing, origin)
+        self._start_events = tuple(self._presenter.start())
+
+    @override
+    async def stream(self, scope: ProviderAttemptScope) -> AsyncIterator[StreamOutput]:
+        assert self._client is not None and self._presenter is not None
+        transport = self._transport
+        presenter = self._presenter
+        source = self.context.source
+        history = self.context.history
+        sdk_stream = await transport._create_sdk_stream(
+            self.sent_body,
+            client=self._client,
+            request_client=self._request_client,
+            extra_headers=self._extra_headers,
+        )
+        stream = scope.retain(
+            OpenAIStreamAdapter(sdk_stream, read_timeout_s=transport._read_timeout_s)
+        )
+        started = False
+        async for upstream_event in stream:
+            self._stopped |= upstream_event.type in {
+                "response.completed",
+                "response.incomplete",
+            }
+            if not scope.attempt.accepted:
+                await scope.attempt.accept()
+            if not started:
+                started = True
+                if self._start_events:
+                    yield StreamOutput(self._start_events)
+            payload = cast(JsonObject, upstream_event.to_dict(mode="json"))
+            failed = upstream_event.type in {
+                "response.failed",
+                "error",
+                "response.error",
+            }
+            context_exceeded = reports_context_window_incomplete(
+                upstream_event.type, payload
+            )
+            # Failed snapshots constrain recovery without replacing the
+            # provider's own error with an output-eligibility failure.
+            source.observe(
+                "responses",
+                payload,
+                continuing=self.context.continuing and not (failed or context_exceeded),
+            )
+            if self._adapt_event is not None:
+                try:
+                    payload = self._adapt_event(upstream_event.type, payload)
+                except RetryableProviderProtocolError:
+                    if not failed:
+                        raise
+                    stream_failure = responses_stream_failure_from_event(
+                        upstream_event.type, payload
+                    )
+                    stream_failure.payload = None
+                    raise stream_failure from None
+            for group in self._tool_buffer.feed(upstream_event.type, payload):
+                if (failed or context_exceeded) and group[-1][0] == upstream_event.type:
+                    payload = group[-1][1]
+                    continue
+                if frames := _present(presenter, group):
+                    yield completed_output(frames)
+            if failed:
+                raise responses_stream_failure_from_event(upstream_event.type, payload)
+            if context_exceeded:
+                raise context_window_exceeded_provider_failure()
+            history.accepted()
+            if presenter.completed:
+                break
+        if not presenter.completed:
+            raise _TruncatedResponsesStream(
+                "Provider Responses stream ended without a terminal event."
+            )
+
+    @override
+    def resolution_error(self, error: Exception) -> Exception:
+        return _effective_error(error)
+
+    @override
+    def abandon(self, error: Exception) -> Iterator[StreamOutput]:
+        if self._presenter is None:
+            return
+        for group in self._tool_buffer.abandon():
+            if frames := _present(self._presenter, group):
+                yield completed_output(frames)
+
+    @override
+    def failure_payload(
+        self, error: Exception, failure: ExecutionFailure
+    ) -> JsonObject | None:
+        if self._presenter is None:
+            return None
+        return self._presenter.failure_payload(error, failure)
+
+    @override
+    def handoff(self) -> Iterator[StreamOutput]:
+        if isinstance(self._presenter, GeminiResponsesStream):
+            for event in self._presenter.handoff():
+                yield StreamOutput((event,))
+
+
+def _present(
+    presenter: ResponsesStreamPresenter,
+    group: Iterable[tuple[str, JsonObject]],
+) -> tuple[str, ...]:
+    return tuple(
+        event for kind, value in group for event in presenter.feed(kind, value)
+    )
